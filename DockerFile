@@ -92,7 +92,6 @@ RUN apt-get update && apt-get install -y \
 
 RUN pip install --upgrade pip
 
-RUN pip install --no-cache-dir playwright==1.57.0
 
 # CLEAN OLD CACHE
 RUN rm -rf /root/.cache/ms-playwright
@@ -105,10 +104,16 @@ RUN python -m playwright install chromium
 RUN find /ms-playwright -type f | head
 
 COPY requirements.txt .
+
+RUN pip install --upgrade pip
+
+RUN sed -i '/playwright/d' requirements.txt
+
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+RUN pip install --no-cache-dir playwright==1.57.0
 
-EXPOSE 8000
+RUN rm -rf /ms-playwright
+RUN rm -rf /root/.cache/ms-playwright
 
-CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+RUN python -m playwright install chromium
