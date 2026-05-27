@@ -109,8 +109,16 @@ async def get_dynamic_session_token(proxy_config: Optional[Dict] = None):
     """Get dynamic session token using Playwright"""
     try:
         async with async_playwright() as p:
-            browser_args = ['--no-sandbox', '--disable-dev-shm-usage'] if platform.system() == 'Linux' else []
-            browser = await p.chromium.launch(headless=True, proxy=proxy_config, args=browser_args)
+            browser_args = ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'] if platform.system() == 'Linux' else []
+            try:
+                browser = await p.chromium.launch(proxy=proxy_config, args=browser_args)
+            except Exception as launch_err:
+                print(f"Chromium launch error: {launch_err}")
+                # Try with channel if available
+                try:
+                    browser = await p.chromium.launch(channel='chrome', args=browser_args)
+                except:
+                    raise launch_err
             page = await browser.new_page()
             await page.set_extra_http_headers({
                 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -139,8 +147,16 @@ async def extract_merchant_data(site_url: str, proxy_config: Optional[Dict] = No
 
     try:
         async with async_playwright() as p:
-            browser_args = ['--no-sandbox', '--disable-dev-shm-usage'] if platform.system() == 'Linux' else []
-            browser = await p.chromium.launch(headless=True, proxy=proxy_config, args=browser_args)
+            browser_args = ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'] if platform.system() == 'Linux' else []
+            try:
+                browser = await p.chromium.launch(proxy=proxy_config, args=browser_args)
+            except Exception as launch_err:
+                print(f"Chromium launch error: {launch_err}")
+                # Try with channel if available
+                try:
+                    browser = await p.chromium.launch(channel='chrome', args=browser_args)
+                except:
+                    raise launch_err
             page = await browser.new_page()
             await page.set_extra_http_headers({
                 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
