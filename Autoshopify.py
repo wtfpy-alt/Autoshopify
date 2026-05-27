@@ -3,9 +3,7 @@ import aiohttp
 import json
 import re
 import random
-import argparse
 from urllib.parse import urlparse
-from flask import Flask, request, jsonify
 import os
 import time
 
@@ -1008,75 +1006,71 @@ def parse_cc_string(cc_string):
         'cvv': parts[3].strip()
     }
 
-async def process_card_async(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
-    return await process_card(cc, mes, ano, cvv, site_url, variant_id, proxy_str)
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+import uvicorn
 
-app = Flask(__name__)
+app = FastAPI()
 
-@app.route('/shopify', methods=['GET'])
-def shopify_checker():
+
+@app.get("/shopify")
+async def shopify_checker(
+    site: str,
+    cc: str,
+    proxy: str = None,
+    variant: str = None
+):
+
     try:
-        site = request.args.get('site')
-        cc_string = request.args.get('cc')
-        proxy_str = request.args.get('proxy')
-        
-        if not site:
-            return jsonify({
-                "error": "Missing 'site' parameter",
-                "status": False
-            }), 400
-        
-        if not cc_string:
-            return jsonify({
-                "error": "Missing 'cc' parameter in format CC|MM|YYYY|CVV",
-                "status": False
-            }), 400
-        
-        try:
-            cc_parts = parse_cc_string(cc_string)
-            cc = cc_parts['cc']
-            mes = cc_parts['mes']
-            ano = cc_parts['ano']
-            cvv = cc_parts['cvv']
-        except ValueError as e:
-            return jsonify({
-                "error": str(e),
-                "status": False
-            }), 400
-        
-        variant_id = request.args.get('variant')
-        
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        try:
-            success, message, gateway, price, currency = loop.run_until_complete(
-                process_card_async(cc, mes, ano, cvv, site, variant_id, proxy_str)
-            )
-        finally:
-            loop.close()
-        
+
+        cc_parts = parse_cc_string(cc)
+
+        success, message, gateway, price, currency = await process_card(
+            cc_parts['cc'],
+            cc_parts['mes'],
+            cc_parts['ano'],
+            cc_parts['cvv'],
+            site,
+            variant,
+            proxy
+        )
+
         clean_response = extract_clean_response(message)
-        
-        response_data = {
+
+        return {
             "Gateway": gateway,
-            "Price": float(price) if price.replace('.', '', 1).isdigit() else 0.0,
+            "Price": (
+                float(price)
+                if str(price).replace('.', '', 1).isdigit()
+                else 0.0
+            ),
             "Response": clean_response,
             "Status": success,
-            "cc": cc_string
+            "cc": cc
         }
-        
-        return jsonify(response_data)
-        
+
     except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "status": False,
-            "Gateway": "UNKNOWN",
-            "Price": 0.0,
-            "Response": f"ERROR: {str(e)}",
-            "cc": request.args.get('cc', '')
-        }), 500
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": str(e),
+                "status": False,
+                "Gateway": "UNKNOWN",
+                "Price": 0.0,
+                "Response": f"ERROR: {str(e)}",
+                "cc": cc
+            }
+        )
+
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5000, debug=False)
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=5000,
+        workers=1,
+        loop="uvloop",
+        http="httptools"
+    )
