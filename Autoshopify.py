@@ -1006,71 +1006,252 @@ def parse_cc_string(cc_string):
         'cvv': parts[3].strip()
     }
 
+
+
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from pydantic import BaseModel
 import uvicorn
+import asyncio
+import time
 
 app = FastAPI()
 
+app.add_middleware(
+    GZipMiddleware,
+    minimum_size=1000
+)
 
-@app.get("/shopify")
+MAX_CONCURRENT = 300
+
+semaphore = asyncio.Semaphore(
+    MAX_CONCURRENT
+)
+
+REQUEST_COUNT = 0
+START_TIME = time.time()
+
+
+# =========================
+# REQUEST MODELS
+# =========================
+
+class CardRequest(BaseModel):
+
+    cc: str
+    site: str
+    proxy: str | None = None
+    variant: str | None = None
+
+
+class BatchRequest(BaseModel):
+
+    cards: list[CardRequest]
+
+
+# =========================
+# STATS
+# =========================
+
+@app.get("/")
+async def home():
+
+    uptime = max(
+        int(time.time() - START_TIME),
+        1
+    )
+
+    rps = round(
+        REQUEST_COUNT / uptime,
+        2
+    )
+
+    return {
+        "status": "online",
+        "requests": REQUEST_COUNT,
+        "uptime": uptime,
+        "rps": rps,
+        "max_concurrent": MAX_CONCURRENT
+    }
+
+
+# =========================
+# SINGLE CHECK
+# =========================
+
+@app.post("/shopify")
 async def shopify_checker(
-    site: str,
-    cc: str,
-    proxy: str = None,
-    variant: str = None
+    data: CardRequest
 ):
 
-    try:
+    global REQUEST_COUNT
 
-        cc_parts = parse_cc_string(cc)
+    REQUEST_COUNT += 1
 
-        success, message, gateway, price, currency = await process_card(
-            cc_parts['cc'],
-            cc_parts['mes'],
-            cc_parts['ano'],
-            cc_parts['cvv'],
-            site,
-            variant,
-            proxy
-        )
+    async with semaphore:
 
-        clean_response = extract_clean_response(message)
+        try:
 
-        return {
-            "Gateway": gateway,
-            "Price": (
-                float(price)
-                if str(price).replace('.', '', 1).isdigit()
-                else 0.0
-            ),
-            "Response": clean_response,
-            "Status": success,
-            "cc": cc
-        }
+            cc_parts = parse_cc_string(
+                data.cc
+            )
 
-    except Exception as e:
+            success, message, gateway, price, currency = (
+                await asyncio.wait_for(
+                    process_card(
+                        cc_parts['cc'],
+                        cc_parts['mes'],
+                        cc_parts['ano'],
+                        cc_parts['cvv'],
+                        data.site,
+                        data.variant,
+                        data.proxy
+                    ),
+                    timeout=20
+                )
+            )
 
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": str(e),
-                "status": False,
-                "Gateway": "UNKNOWN",
-                "Price": 0.0,
-                "Response": f"ERROR: {str(e)}",
-                "cc": cc
+            return {
+                "Gateway": gateway,
+                "Price": (
+                    float(price)
+                    if str(price).replace('.', '', 1).isdigit()
+                    else 0.0
+                ),
+                "Response": extract_clean_response(
+                    message
+                ),
+                "Status": success,
+                "cc": data.cc
             }
-        )
 
+        except asyncio.TimeoutError:
+
+            return JSONResponse(
+                status_code=408,
+                content={
+                    "error": "timeout",
+                    "Status": False,
+                    "cc": data.cc
+                }
+            )
+
+        except Exception as e:
+
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": str(e),
+                    "Status": False,
+                    "cc": data.cc
+                }
+            )
+
+
+# =========================
+# BATCH CHECK
+# =========================
+
+@app.post("/shopify/batch")
+async def shopify_batch(
+    data: BatchRequest
+):
+
+    global REQUEST_COUNT
+
+    REQUEST_COUNT += len(data.cards)
+
+    async def handle_card(card):
+
+        async with semaphore:
+
+            try:
+
+                cc_parts = parse_cc_string(
+                    card.cc
+                )
+
+                success, message, gateway, price, currency = (
+                    await asyncio.wait_for(
+                        process_card(
+                            cc_parts['cc'],
+                            cc_parts['mes'],
+                            cc_parts['ano'],
+                            cc_parts['cvv'],
+                            card.site,
+                            card.variant,
+                            card.proxy
+                        ),
+                        timeout=20
+                    )
+                )
+
+                return {
+                    "Gateway": gateway,
+                    "Price": (
+                        float(price)
+                        if str(price).replace('.', '', 1).isdigit()
+                        else 0.0
+                    ),
+                    "Response": extract_clean_response(
+                        message
+                    ),
+                    "Status": success,
+                    "cc": card.cc
+                }
+
+            except Exception as e:
+
+                return {
+                    "error": str(e),
+                    "Status": False,
+                    "cc": card.cc
+                }
+
+    tasks = [
+        handle_card(card)
+        for card in data.cards
+    ]
+
+    results = await asyncio.gather(
+        *tasks,
+        return_exceptions=False
+    )
+
+    return {
+        "results": results
+    }
+
+
+# =========================
+# START
+# =========================
 
 if __name__ == "__main__":
 
     uvicorn.run(
-        app,
+        "Autoshopify:app",
         host="0.0.0.0",
         port=5000,
+
         workers=1,
-        loop="uvloop",
-        http="httptools"
+
+        loop="asyncio",
+
+        http="httptools",
+
+        access_log=False,
+
+        server_header=False,
+
+        date_header=False,
+
+        ws="none",
+
+        timeout_keep_alive=30,
+
+        limit_concurrency=1000,
+
+        backlog=2048
     )
