@@ -89,23 +89,26 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# =========================
-# PYTHON PACKAGES
-# =========================
+    
+FROM python:3.13-slim
 
-COPY requirements.txt .
+WORKDIR /app
 
-RUN pip3 install --upgrade pip
+RUN python3.13 -m pip install pip --upgrade
 
-RUN pip3 install --no-cache-dir -r requirements.txt
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/app/ms-playwright
 
-RUN pip3 install playwright==1.52.0
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates git
+RUN apt-get update -y
+RUN apt-get install -y gdal-bin
 
-# =========================
-# INSTALL PLAYWRIGHT BROWSERS
-# =========================
-
-RUN python3 -m playwright install chromium
+# special lib for playwright
+RUN pip install --no-cache-dir playwright==1.57.0
+RUN python -m playwright install --with-deps chromium
 
 # =========================
 # VERIFY
