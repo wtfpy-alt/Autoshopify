@@ -27,9 +27,6 @@ from playwright.async_api import async_playwright
 # ============================================================
 # Configuration
 # ============================================================
-import os
-
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/root/.cache/ms-playwright"
 
 # Thread pool for concurrent operations - increased for max parallelism
 executor = ThreadPoolExecutor(max_workers=200)
