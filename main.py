@@ -147,9 +147,16 @@ async def extract_merchant_data(site_url: str, proxy_config: Optional[Dict] = No
 
     try:
         async with async_playwright() as p:
-            browser_args = ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'] if platform.system() == 'Linux' else []
+            browser_args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--single-process",
+                "--no-zygote"
+            ] if platform.system() == 'Linux' else []
             try:
-                browser = await p.chromium.launch(proxy=proxy_config, args=browser_args)
+                browser = await p.chromium.launch(headless=True, proxy=proxy_config, args=browser_args)
             except Exception as launch_err:
                 print(f"Chromium launch error: {launch_err}")
                 # Try with channel if available
