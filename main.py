@@ -152,7 +152,6 @@ async def extract_merchant_data(site_url: str, proxy_config: Optional[Dict] = No
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--single-process",
                 "--no-zygote"
             ] if platform.system() == 'Linux' else []
             try:
