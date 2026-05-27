@@ -88,6 +88,8 @@ RUN pip install --no-cache-dir \
 
 RUN playwright install chromium
 
+RUN ls -R /ms-playwright
+
 # =========================
 # VERIFY INSTALL
 # =========================
