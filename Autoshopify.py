@@ -311,8 +311,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     'Content-Type': 'application/json',
                     'Accept': 'application/json'
                 }
-                cart_data = {'items': [{'id': int(variant_id), 'quantity': 1}]}
-                cart_resp = await session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy)
+                try:
+                    cart_data = {'items': [{'id': int(variant_id), 'quantity': 1}]}
+                    cart_resp = await session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy)
+                except (ValueError, TypeError) as e:
+                    return False, f"Invalid variant ID: {str(e)}", gateway, total_price, currency
             
             if cart_resp.status != 200:
                 return False, f"Cart failed with status {cart_resp.status}", gateway, total_price, currency
@@ -465,8 +468,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         'paymentLines': [],
                         'billingAddress': {
                             'streetAddress': {
-                                'address1': '', 'city': '', 'countryCode': country_code,
-                                'lastName': '', 'zoneCode': 'ENG', 'phone': ''
+                                'address1': street, 'address2': address2, 'city': city,
+                                'countryCode': country_code, 'postalCode': s_zip,
+                                'firstName': firstName, 'lastName': lastName,
+                                'zoneCode': state, 'phone': phone
                             }
                         }
                     },
@@ -613,16 +618,21 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             payment_data = seller_proposal.get('payment', {})
             if payment_data and payment_data.get('__typename') == 'FilledPaymentTerms':
                 payment_methods = payment_data.get('availablePaymentLines', [])
-                for method in payment_methods:
-                    payment_method = method.get('paymentMethod', {})
-                    if payment_method.get('name') or payment_method.get('paymentMethodIdentifier'):
-                        payment_identifier = payment_method.get('paymentMethodIdentifier')
-                        displayName = payment_method.get('extensibilityDisplayName') or payment_method.get('name', 'Unknown')
-                        
-                        gateway = payment_method.get('extensibilityDisplayName') or payment_method.get('name', 'UNKNOWN')
-                        total_price = str(float(running_total) + shipping_amount + tax_amount)
-                        
-                        break
+                if payment_methods and len(payment_methods) > 0:
+                    for method in payment_methods:
+                        payment_method = method.get('paymentMethod', {})
+                        if payment_method and (payment_method.get('name') or payment_method.get('paymentMethodIdentifier')):
+                            payment_identifier = payment_method.get('paymentMethodIdentifier')
+                            displayName = payment_method.get('extensibilityDisplayName') or payment_method.get('name', 'Unknown')
+                            
+                            gateway = payment_method.get('extensibilityDisplayName') or payment_method.get('name', 'UNKNOWN')
+                            total_price = str(float(running_total) + shipping_amount + tax_amount)
+                            
+                            break
+                else:
+                    return False, "No payment methods available", gateway, total_price, currency
+            else:
+                return False, "Payment data unavailable or not filled", gateway, total_price, currency
             
             if not payment_identifier:
                 return False, "No valid payment method found", gateway, total_price, currency
