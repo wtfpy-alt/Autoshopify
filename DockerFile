@@ -1,25 +1,23 @@
-FROM ubuntu:22.04
+FROM python:3.13-slim
+
+WORKDIR /app
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-
-WORKDIR /app
+ENV PIP_NO_CACHE_DIR=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # =========================
-# PYTHON + SYSTEM DEPS
+# SYSTEM DEPS
 # =========================
 
 RUN apt-get update && apt-get install -y \
-    software-properties-common \
     curl \
     wget \
     git \
     unzip \
     xvfb \
-    python3 \
-    python3-pip \
-    python3-venv \
     ca-certificates \
     fonts-liberation \
     fonts-freefont-ttf \
@@ -51,10 +49,8 @@ RUN apt-get update && apt-get install -y \
     libharfbuzz-icu0 \
     libharfbuzz0b \
     libhyphen0 \
-    libicu70 \
-    libjpeg-turbo8 \
+    libjpeg62-turbo \
     liblcms2-2 \
-    libmanette-0.2-0 \
     libnotify4 \
     libnspr4 \
     libnss3 \
@@ -87,45 +83,32 @@ RUN apt-get update && apt-get install -y \
     libxtst6 \
     xdg-utils \
     ffmpeg \
+    gdal-bin \
     && rm -rf /var/lib/apt/lists/*
 
-    
-FROM python:3.13-slim
+# =========================
+# PYTHON
+# =========================
 
-WORKDIR /app
+RUN pip install --upgrade pip
 
-RUN python3.13 -m pip install pip --upgrade
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/app/ms-playwright
-
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates git
-RUN apt-get update -y
-RUN apt-get install -y gdal-bin
-
-# special lib for playwright
 RUN pip install --no-cache-dir playwright==1.57.0
-RUN python -m playwright install --with-deps chromium
 
-# =========================
-# VERIFY
-# =========================
+# CLEAN OLD CACHE
+RUN rm -rf /root/.cache/ms-playwright
+RUN rm -rf /ms-playwright
 
-RUN python3 -c "from playwright.sync_api import sync_playwright; \
-with sync_playwright() as p: \
-    browser = p.chromium.launch(headless=True,args=['--no-sandbox']); \
-    print(browser.version); \
-    browser.close()"
+# INSTALL CHROMIUM
+RUN python -m playwright install chromium
 
-# =========================
-# COPY APP
-# =========================
+# VERIFY INSTALL
+RUN find /ms-playwright -type f | head
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
 EXPOSE 8000
 
-CMD ["python3", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
