@@ -111,12 +111,12 @@ async def get_dynamic_session_token(proxy_config: Optional[Dict] = None):
         async with async_playwright() as p:
             browser_args = ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'] if platform.system() == 'Linux' else []
             try:
-                browser = await p.chromium.launch(headless=True, proxy=proxy_config, args=browser_args)
+                browser = await p.chromium.launch(proxy=proxy_config, args=browser_args)
             except Exception as launch_err:
                 print(f"Chromium launch error: {launch_err}")
                 # Try with channel if available
                 try:
-                    browser = await p.chromium.launch(headless=True, channel='chrome', args=browser_args)
+                    browser = await p.chromium.launch(channel='chrome', args=browser_args)
                 except:
                     raise launch_err
             page = await browser.new_page()
@@ -155,12 +155,12 @@ async def extract_merchant_data(site_url: str, proxy_config: Optional[Dict] = No
                 "--no-zygote"
             ] if platform.system() == 'Linux' else []
             try:
-                browser = await p.chromium.launch(headless=True, proxy=proxy_config, args=browser_args)
+                browser = await p.chromium.launch(proxy=proxy_config, args=browser_args)
             except Exception as launch_err:
                 print(f"Chromium launch error: {launch_err}")
                 # Try with channel if available
                 try:
-                    browser = await p.chromium.launch(headless=True, channel='chrome', args=browser_args)
+                    browser = await p.chromium.launch(channel='chrome', args=browser_args)
                 except:
                     raise launch_err
             page = await browser.new_page()
