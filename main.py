@@ -29,7 +29,7 @@ from playwright.async_api import async_playwright
 # ============================================================
 
 # Thread pool for concurrent operations - increased for max parallelism
-executor = ThreadPoolExecutor(max_workers=200)
+executor = ThreadPoolExecutor(max_workers=100)
 
 # Cache for merchant data and session tokens
 MERCHANT_CACHE: Dict[str, Any] = {}
